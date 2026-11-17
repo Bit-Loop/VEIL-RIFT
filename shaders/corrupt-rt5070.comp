@@ -1,0 +1,166 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT u_tlas;
+layout(set = 0, binding = 1, rgba16f) uniform image2D u_gi_accum;
+layout(set = 0, binding = 2) uniform sampler2D u_rift_tex;
+layout(set = 0, binding = 3) uniform sampler2D u_life_tex;
+
+struct Emitter {
+    vec4 pos_radius; // xy = uv, z = height, w = radius
+    vec4 color_int;  // rgb = linear color, w = intensity
+};
+
+layout(set = 0, binding = 4, std140) uniform SceneUBO {
+    vec4  u_meta;       // x=time, y=aspect, z=emitter_count, w=temporal_blend
+    vec4  u_loads;      // x=cpu, y=gpu, z=ram, w=burst
+    vec4  u_mouse;      // x=mx, y=my, z=speed, w=dwell
+    Emitter emitters[24];
+} ubo;
+
+// Interleaved Gradient Noise (Jimenez 2014) — ultra-clean blue-noise-like angular jitter
+float ign(vec2 px, float frame_seed) {
+    px += frame_seed * vec2(47.0, 17.0);
+    return fract(52.9829189 * fract(dot(px, vec2(0.06711056, 0.00583715))));
+}
+
+float hash21(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// Trace hardware RT-core shadow ray in 3D aspect-corrected space:
+// World coords: X in [0..aspect], Y in [0..1], Z in [0..0.5]
+float traceVisibilityRT(vec3 origin, vec3 target, float t_max_dist) {
+    vec3 dir = target - origin;
+    float dist = length(dir);
+    if (dist < 0.0015) return 1.0;
+    dir /= dist;
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq,
+        u_tlas,
+        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+        0xFF,
+        origin,
+        0.0025,
+        dir,
+        max(0.003, min(dist - 0.003, t_max_dist))
+    );
+    while (rayQueryProceedEXT(rq)) {}
+    if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+        return 0.0;
+    }
+    return 1.0;
+}
+
+void main() {
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = imageSize(u_gi_accum);
+    if (gid.x >= dims.x || gid.y >= dims.y) return;
+
+    vec2 uv = (vec2(gid) + 0.5) / vec2(dims);
+    float aspect = ubo.u_meta.y;
+    float t = ubo.u_meta.x;
+    int n_emit = clamp(int(ubo.u_meta.z + 0.5), 0, 24);
+
+    vec4 rift = texture(u_rift_tex, uv);
+    vec4 life = texture(u_life_tex, uv);
+
+    // Surface height in 3D scene:
+    // Layer 0 CRT surface sits at Z = 0.02; recessed rift interior sits at Z = 0.005
+    float is_recessed = step(0.18, rift.r) * step(0.01, rift.g);
+    float surf_z = mix(0.022, 0.006, is_recessed) + life.r * 0.012;
+    vec3 P = vec3(uv.x * aspect, uv.y, surf_z);
+
+    float frame_phase = mod(floor(t * 60.0), 64.0);
+    float rnd0 = ign(vec2(gid), frame_phase);
+    float rnd1 = ign(vec2(gid) + vec2(13.0, 29.0), frame_phase);
+
+    vec3 direct_irradiance = vec3(0.0);
+    vec3 volumetric_scatter = vec3(0.0);
+
+    // 1. Hardware RT-Core Soft Area Shadow & Volumetric Shaft Tracing across active emitters
+    for (int i = 0; i < n_emit; ++i) {
+        vec4 ep = ubo.emitters[i].pos_radius;
+        vec4 ec = ubo.emitters[i].color_int;
+        if (ec.w <= 0.001) continue;
+
+        vec3 center_L = vec3(ep.x * aspect, ep.y, ep.z);
+        float area_r = ep.w;
+
+        // 2 stratified jittered area-light samples per emitter -> soft physical penumbra shadows!
+        float vis_sum = 0.0;
+        for (int s = 0; s < 2; ++s) {
+            float a = (rnd0 + float(s) * 0.5 + float(i) * 0.381966) * 6.2831853;
+            float r = area_r * sqrt(fract(rnd1 + float(s) * 0.618034 + float(i) * 0.17));
+            vec3 jitter_L = center_L + vec3(cos(a) * r, sin(a) * r, 0.006 * float(s));
+            vis_sum += traceVisibilityRT(P, jitter_L, 2.5);
+        }
+        float vis = vis_sum * 0.5;
+
+        // Also attenuate rays passing through dense Game of Life cellular clusters (semi-translucent bio-lattice)
+        vec2 mid_uv = mix(uv, ep.xy, 0.45 + 0.2 * rnd0);
+        float life_occ = texture(u_life_tex, clamp(mid_uv, vec2(0.001), vec2(0.999))).r;
+        vis *= (1.0 - 0.58 * life_occ);
+
+        vec3 dvec = center_L - P;
+        float d2 = dot(dvec.xy, dvec.xy);
+        float d  = sqrt(d2 + dvec.z * dvec.z);
+
+        // Physical inverse-distance + atmospheric Mie-like cyber-fog falloff
+        float atten = ec.w / (1.0 + 22.0 * d2 + 3.0 * d);
+        float NdotL = clamp((ep.z - surf_z + 0.048) / max(d, 0.025), 0.14, 1.0);
+
+        direct_irradiance += ec.rgb * (atten * vis * NdotL);
+
+        // 2-tap stratified volumetric scattering in cyber-fog media -> 60:1 slotted shadow shaft contrast!
+        vec3 march_P0 = mix(P, center_L, clamp(0.24 + 0.30 * rnd0, 0.06, 0.88));
+        vec3 march_P1 = mix(P, center_L, clamp(0.56 + 0.30 * rnd1, 0.10, 0.92));
+        march_P0.z = 0.028;
+        march_P1.z = 0.030;
+        float vol_vis = 0.5 * (
+            traceVisibilityRT(march_P0, center_L, 2.5) +
+            traceVisibilityRT(march_P1, center_L, 2.5)
+        );
+        vol_vis *= (1.0 - 0.48 * life_occ);
+        float vol_atten = ec.w * exp(-d * 4.4) * (0.012 + 0.988 * vol_vis);
+        volumetric_scatter += ec.rgb * vol_atten * 0.52;
+    }
+
+    // 2. 4-Ray Stochastic Local Bounce / Ambient Occlusion Probe on RTX 5070 RT Cores!
+    float ao_open = 0.0;
+    vec3 bounce_gi = vec3(0.0);
+    for (int b = 0; b < 4; ++b) {
+        float phi = (rnd0 + (float(b) + 0.5) * 0.25) * 6.2831853;
+        vec3 ray_d = normalize(vec3(cos(phi), sin(phi), 0.32 + 0.25 * rnd1));
+        rayQueryEXT rq_ao;
+        rayQueryInitializeEXT(
+            rq_ao, u_tlas,
+            gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+            0xFF, P + vec3(0.0, 0.0, 0.004), 0.002, ray_d, 0.085
+        );
+        while (rayQueryProceedEXT(rq_ao)) {}
+        if (rayQueryGetIntersectionTypeEXT(rq_ao, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+            ao_open += 0.25;
+        } else {
+            // Short-range color bounce off hit occluder wall + nearby cellular phosphor!
+            float t_hit = rayQueryGetIntersectionTEXT(rq_ao, true);
+            vec2 hit_uv = clamp(uv + ray_d.xy * (t_hit / max(aspect, 1.0)), vec2(0.001), vec2(0.999));
+            float hit_life = texture(u_life_tex, hit_uv).g;
+            bounce_gi += vec3(0.0, 0.45, 0.18) * hit_life * 0.12;
+        }
+    }
+
+    vec3 total_light = (direct_irradiance + bounce_gi) * (0.45 + 0.55 * ao_open) + volumetric_scatter;
+
+    // Pack RGB light transport + A = hardware RT ambient occlusion (ao_open)
+    vec4 prev = imageLoad(u_gi_accum, gid);
+    float blend = clamp(ubo.u_meta.w, 0.08, 1.0);
+    vec4 resolved = mix(prev, vec4(total_light, ao_open), blend);
+    imageStore(u_gi_accum, gid, resolved);
+}

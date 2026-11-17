@@ -1,0 +1,917 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="${HOME}/.config/wallpaper-mode"
+STATE_FILE="${STATE_DIR}/state"
+LAST_LIVE_MODE_FILE="${STATE_DIR}/last-live-mode"
+VIDEO_SOURCE_FILE="${STATE_DIR}/video-source"
+AUDIO_FILE="${STATE_DIR}/audio"
+RAYTRACE_FILE="${STATE_DIR}/raytrace"
+MPV_VOLUME_FILE="${STATE_DIR}/mpv-volume"
+MPV_MUTE_FILE="${STATE_DIR}/mpv-mute"
+GAME_MODE_FILE="${STATE_DIR}/game-mode"
+CURRENT_META_FILE="${STATE_DIR}/current-video.json"
+HISTORY_FILE="${STATE_DIR}/history.json"
+VIDEO_RUNNER="${HOME}/.local/bin/video-wallpaper.py"
+APOD_SCRIPT="${HOME}/.local/bin/nasa-apod-wallpaper.sh"
+COMPOSITOR_LAUNCHER="${HOME}/.local/bin/native-linux-compositor"
+PICOM_CONFIG="${HOME}/.config/picom/picom.conf"
+PICOM_LOG="${HOME}/.local/state/picom.log"
+DEFAULT_VIDEO_SOURCE="https://www.youtube.com/watch?v=8VsvdCaSyaQ"
+DEFAULT_VIDEO_TITLE="Fake Cam Hacker Screen 4K"
+CORRUPT_VIDEO_TITLE="tDd // Locked-In Glitch-BBS [8VsvdCaSyaQ]"
+PERMANENT_CORRUPT_VIDEO="${HOME}/Pictures/wallpaper-mode/corrupt-lockin-8VsvdCaSyaQ-permanent.mp4"
+DEFAULT_CACHED_VIDEO="${HOME}/Pictures/wallpaper-mode/default-8VsvdCaSyaQ-first-15min.mp4"
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if [[ ! -d "$RUNTIME_DIR" ]]; then
+    RUNTIME_DIR="/tmp"
+fi
+MPV_IPC_FILE="${RUNTIME_DIR}/wallpaper-mode-mpv.sock"
+CORRUPT_READY_FILE="${RUNTIME_DIR}/wallpaper-mode-corrupt.ready"
+LOCK_FILE="${RUNTIME_DIR}/wallpaper-mode.lock"
+
+mkdir -p "$STATE_DIR" "${HOME}/.local/state"
+
+canonical_mode() {
+    local raw="${1:-}"
+    case "$raw" in
+        corrupt|corrupt-rt|lockin|lockin-rt|locked-in|corruption|cyber|bbs)
+            printf 'corrupt\n'
+            ;;
+        static|game|gaming|game-mode)
+            printf 'static\n'
+            ;;
+        video)
+            printf 'video\n'
+            ;;
+        *)
+            printf 'video\n'
+            ;;
+    esac
+}
+
+mode() {
+    if [[ -r "$STATE_FILE" ]]; then
+        canonical_mode "$(tr -d '[:space:]' < "$STATE_FILE")"
+    elif [[ -r "$GAME_MODE_FILE" ]] && [[ "$(tr -d '[:space:]' < "$GAME_MODE_FILE")" =~ ^(1|on|true|yes)$ ]]; then
+        printf 'static\n'
+    else
+        printf 'video\n'
+    fi
+}
+
+set_mode() {
+    local target
+    target="$(canonical_mode "$1")"
+    printf '%s\n' "$target" > "$STATE_FILE"
+    if [[ "$target" == "static" ]]; then
+        printf 'on\n' > "$GAME_MODE_FILE"
+    else
+        printf 'off\n' > "$GAME_MODE_FILE"
+        printf '%s\n' "$target" > "$LAST_LIVE_MODE_FILE"
+    fi
+}
+
+last_live_mode() {
+    local saved=""
+    if [[ -r "$LAST_LIVE_MODE_FILE" ]]; then
+        saved="$(tr -d '[:space:]' < "$LAST_LIVE_MODE_FILE")"
+    fi
+    case "$saved" in
+        corrupt|video)
+            printf '%s\n' "$saved"
+            ;;
+        *)
+            printf 'corrupt\n'
+            ;;
+    esac
+}
+
+with_lock() {
+    if [[ "${WALLPAPER_MODE_LOCKED:-0}" == "1" ]]; then
+        "$@"
+        return
+    fi
+    exec 8>"$LOCK_FILE"
+    flock -w 15 8
+    WALLPAPER_MODE_LOCKED=1 "$@"
+}
+
+runner_pids() {
+    local pid args cmd
+    while read -r pid args; do
+        [[ -n "${pid:-}" && -n "${args:-}" ]] || continue
+        cmd="${args%% *}"
+        [[ "${cmd##*/}" == python* ]] || continue
+        if [[ "$args" == *"${VIDEO_RUNNER}"* || "$args" == *"video-wallpaper.py"* ]]; then
+            printf '%s\n' "$pid"
+        fi
+    done < <(ps -eo pid=,args=)
+}
+
+video_wallpaper_running() {
+    [[ -n "$(runner_pids | head -n 1)" ]]
+}
+
+corrupt_runner_running() {
+    local pid args cmd
+    while read -r pid args; do
+        [[ -n "${pid:-}" && -n "${args:-}" ]] || continue
+        cmd="${args%% *}"
+        [[ "${cmd##*/}" == python* ]] || continue
+        if [[ "$args" == *"video-wallpaper.py"* && "$args" == *"--corrupt"* ]]; then
+            return 0
+        fi
+    done < <(ps -eo pid=,args=)
+    return 1
+}
+
+wallpaper_mpv_pids() {
+    local pid args command
+    while read -r pid args; do
+        [[ -n "${pid:-}" && -n "${args:-}" ]] || continue
+        command="${args%% *}"
+        [[ "${command##*/}" == "mpv" ]] || continue
+        if [[ "$args" == *"$MPV_IPC_FILE"* ]] \
+            || [[ "$args" == *"/.cache/wallpaper-mode/"* ]] \
+            || [[ "$args" == *"$PERMANENT_CORRUPT_VIDEO"* ]] \
+            || { [[ "$args" == *"--wid="* ]] && [[ "$args" == *"--no-input-default-bindings"* ]] && [[ "$args" == *"--no-input-terminal"* ]]; }; then
+            printf '%s\n' "$pid"
+        fi
+    done < <(ps -eo pid=,args=)
+}
+
+wallpaper_mpv_count() {
+    wallpaper_mpv_pids | wc -l | tr -d '[:space:]'
+}
+
+wallpaper_mpv_running() {
+    [[ "$(wallpaper_mpv_count)" != "0" ]]
+}
+
+picom_running() {
+    pgrep -x picom >/dev/null 2>&1
+}
+
+video_source() {
+    if [[ -s "$VIDEO_SOURCE_FILE" ]]; then
+        tr -d '\n' < "$VIDEO_SOURCE_FILE"
+    else
+        printf '%s\n' "$DEFAULT_VIDEO_SOURCE"
+    fi
+}
+
+is_url() {
+    [[ "$1" =~ ^https?:// ]]
+}
+
+normalize_source() {
+    local source="$1"
+    python3 - "$source" <<'PY'
+import sys
+from urllib.parse import parse_qs, urlparse
+
+source = sys.argv[1].strip()
+parsed = urlparse(source)
+host = parsed.netloc.lower()
+video_id = ""
+
+if host.endswith("youtu.be"):
+    video_id = parsed.path.strip("/").split("/")[0]
+elif host.endswith("youtube.com"):
+    if parsed.path == "/watch":
+        video_id = parse_qs(parsed.query).get("v", [""])[0]
+    else:
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 2 and parts[0] in {"embed", "live", "shorts", "v"}:
+            video_id = parts[1]
+
+if video_id:
+    print(f"https://www.youtube.com/watch?v={video_id}")
+else:
+    print(source)
+PY
+}
+
+set_video_source() {
+    local source normalized
+    source="$1"
+    normalized="$(normalize_source "$source")"
+    printf '%s\n' "$normalized" > "$VIDEO_SOURCE_FILE"
+}
+
+prepare_video_config() {
+    local source prepared
+    source="$(video_source)"
+    [[ -n "$source" ]] || source="$DEFAULT_VIDEO_SOURCE"
+    prepared="$(normalize_source "$source")"
+    printf '%s\n' "$prepared" > "$VIDEO_SOURCE_FILE"
+}
+
+audio_status() {
+    if [[ -r "$AUDIO_FILE" ]] && [[ "$(tr -d '[:space:]' < "$AUDIO_FILE")" =~ ^(1|on|true|yes)$ ]]; then
+        printf 'on\n'
+    else
+        printf 'off\n'
+    fi
+}
+
+set_audio() {
+    printf '%s\n' "$1" > "$AUDIO_FILE"
+}
+
+raytrace_status() {
+    if [[ -r "$RAYTRACE_FILE" ]] && [[ "$(tr -d '[:space:]' < "$RAYTRACE_FILE" | tr '[:upper:]' '[:lower:]')" =~ ^(1|on|true|yes)$ ]]; then
+        printf 'on\n'
+    else
+        printf 'off\n'
+    fi
+}
+
+set_raytrace() {
+    printf '%s\n' "$1" > "$RAYTRACE_FILE"
+}
+
+toggle_raytrace() {
+    if [[ "$(raytrace_status)" == "on" ]]; then
+        set_raytrace off
+        notify-send "Glitch-BBS Raytracing: OFF [2D]" "Switched Locked-In Corruption to 2D mode." >/dev/null 2>&1 || true
+    else
+        set_raytrace on
+        notify-send "Glitch-BBS Raytracing: ON [RTX 5070 RT]" "Hardware Vulkan RT-Core area shadows, volumetric shafts & CRT specular enabled." >/dev/null 2>&1 || true
+    fi
+}
+
+mpv_volume_control() {
+    local action="${1:-status}"
+    local value="${2:-}"
+    python3 - "$MPV_VOLUME_FILE" "$MPV_MUTE_FILE" "$AUDIO_FILE" "$MPV_IPC_FILE" "$action" "$value" <<'PY'
+import json
+import socket
+import sys
+from pathlib import Path
+
+volume_path, mute_path, audio_path, ipc_path, action, value = sys.argv[1:]
+truthy = {"1", "on", "true", "yes", "muted"}
+
+
+def read_volume() -> int:
+    try:
+        raw = Path(volume_path).read_text().strip().rstrip("%")
+        volume = int(float(raw))
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        volume = 100
+    return max(0, min(100, volume))
+
+
+def read_bool(path: str, default: bool = False) -> bool:
+    try:
+        raw = Path(path).read_text().strip().lower()
+    except (FileNotFoundError, OSError):
+        return default
+    return raw in truthy
+
+
+def write_text(path: str, text: str) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text)
+
+
+def parse_volume(raw: str, fallback: int) -> int:
+    try:
+        volume = int(float(raw.strip().rstrip("%")))
+    except (AttributeError, TypeError, ValueError):
+        return fallback
+    return max(0, min(100, volume))
+
+
+def parse_delta(raw: str) -> int:
+    try:
+        return int(float(raw.strip().rstrip("%")))
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def send_mpv(command: list[object]) -> None:
+    sock_path = Path(ipc_path)
+    if not sock_path.exists():
+        return
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(0.35)
+            client.connect(str(sock_path))
+            payload = json.dumps({"command": command}).encode("utf-8") + b"\n"
+            client.sendall(payload)
+    except OSError:
+        return
+
+
+volume = read_volume()
+muted = read_bool(mute_path)
+audio_enabled = read_bool(audio_path)
+
+if action in {"add", "change"}:
+    volume = max(0, min(100, volume + parse_delta(value)))
+    muted = False
+elif action == "up":
+    volume = min(100, volume + 3)
+    muted = False
+elif action == "down":
+    volume = max(0, volume - 3)
+    muted = False
+elif action == "set":
+    volume = parse_volume(value, volume)
+    muted = False
+elif action in {"mute-toggle", "toggle-mute"}:
+    muted = not muted
+elif action not in {"status", "json-status"}:
+    print(f"unknown mpv volume action: {action}", file=sys.stderr)
+    sys.exit(2)
+
+if action not in {"status", "json-status"}:
+    write_text(volume_path, f"{volume}\n")
+    write_text(mute_path, "on\n" if muted else "off\n")
+    send_mpv(["set_property", "volume", volume])
+    send_mpv(["set_property", "mute", bool(muted or not audio_enabled)])
+
+effective_muted = bool(muted or not audio_enabled)
+if action == "json-status":
+    print(json.dumps({
+        "volume": volume,
+        "muted": muted,
+        "effective_muted": effective_muted,
+        "audio_enabled": audio_enabled,
+    }))
+else:
+    print(f"{volume}% ({'muted' if effective_muted else 'on'})")
+PY
+}
+
+game_mode_status() {
+    if [[ "$(mode)" == "static" ]]; then
+        printf 'on\n'
+    else
+        printf 'off\n'
+    fi
+}
+
+start_picom() {
+    export DISPLAY="${DISPLAY:-:0}"
+    export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+    if ! command -v picom >/dev/null; then
+        return 1
+    fi
+    if picom_running; then
+        return 0
+    fi
+    if [[ -x "$COMPOSITOR_LAUNCHER" ]]; then
+        "$COMPOSITOR_LAUNCHER" 8>&-
+    else
+        picom --config "$PICOM_CONFIG" -b --log-file "$PICOM_LOG" 8>&-
+    fi
+    local _i
+    for _i in {1..15}; do
+        if picom_running; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 0
+}
+
+stop_picom() {
+    local _i
+    pkill -x picom >/dev/null 2>&1 || true
+    for _i in {1..20}; do
+        if ! picom_running; then
+            return 0
+        fi
+        sleep 0.08
+    done
+    pkill -9 -x picom >/dev/null 2>&1 || true
+}
+
+stop_live_wallpaper() {
+    local pid _attempt
+    while read -r pid; do
+        [[ -n "${pid:-}" ]] || continue
+        kill -TERM "$pid" >/dev/null 2>&1 || true
+    done < <(runner_pids; wallpaper_mpv_pids)
+
+    for _attempt in {1..30}; do
+        if ! video_wallpaper_running && ! wallpaper_mpv_running; then
+            break
+        fi
+        sleep 0.1
+    done
+
+    if video_wallpaper_running || wallpaper_mpv_running; then
+        while read -r pid; do
+            [[ -n "${pid:-}" ]] || continue
+            kill -KILL "$pid" >/dev/null 2>&1 || true
+        done < <(runner_pids; wallpaper_mpv_pids)
+        sleep 0.1
+    fi
+
+    rm -f "$MPV_IPC_FILE" "$CORRUPT_READY_FILE" "${RUNTIME_DIR}/wallpaper-mode-corrupt-0.bgra" "${RUNTIME_DIR}/wallpaper-mode-corrupt-1.bgra" >/dev/null 2>&1 || true
+}
+
+wait_for_live_startup() {
+    local runner_pid="$1"
+    local expect_mode="${2:-video}"
+    local _attempt
+    for _attempt in {1..60}; do
+        if ! kill -0 "$runner_pid" >/dev/null 2>&1; then
+            return 1
+        fi
+        if [[ "$expect_mode" == "corrupt" ]]; then
+            if corrupt_runner_running && [[ -e "$CORRUPT_READY_FILE" ]]; then
+                sleep 0.20
+                if kill -0 "$runner_pid" >/dev/null 2>&1; then
+                    return 0
+                fi
+            fi
+        elif video_wallpaper_running && wallpaper_mpv_running && [[ -S "$MPV_IPC_FILE" ]]; then
+            sleep 0.25
+            if kill -0 "$runner_pid" >/dev/null 2>&1 && wallpaper_mpv_running; then
+                return 0
+            fi
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+start_video() {
+    export DISPLAY="${DISPLAY:-:0}"
+    export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+    local prepared_source runner_pid
+
+    if ! command -v mpv >/dev/null; then
+        notify-send "Wallpaper mode" "mpv is not installed." >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    start_picom || true
+
+    if video_wallpaper_running || wallpaper_mpv_running; then
+        stop_live_wallpaper
+    fi
+
+    prepare_video_config
+    prepared_source="$(video_source)"
+    if [[ -n "$prepared_source" ]] && { is_url "$prepared_source" || [[ -r "$prepared_source" ]]; }; then
+        setsid "$VIDEO_RUNNER" "$prepared_source" >> "${HOME}/.local/state/wallpaper-mode.log" 2>&1 8>&- < /dev/null &
+        runner_pid="$!"
+        if ! wait_for_live_startup "$runner_pid"; then
+            stop_live_wallpaper
+            notify-send "Wallpaper mode" "Video wallpaper failed to start. Switching to Static / Gaming mode." >/dev/null 2>&1 || true
+            return 1
+        fi
+    else
+        notify-send "Wallpaper mode" "No playable video is available." >/dev/null 2>&1 || true
+        return 1
+    fi
+}
+
+start_corrupt() {
+    export DISPLAY="${DISPLAY:-:0}"
+    export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+    local runner_pid
+
+    if ! command -v mpv >/dev/null; then
+        notify-send "Locked-In Corruption" "mpv is not installed." >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if [[ ! -r "$PERMANENT_CORRUPT_VIDEO" && ! -r "$DEFAULT_CACHED_VIDEO" ]]; then
+        notify-send "Locked-In Corruption" "Permanent hacker video clip is missing." >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    start_picom || true
+
+    if video_wallpaper_running || wallpaper_mpv_running; then
+        stop_live_wallpaper
+    fi
+
+    if [[ -r /proc/driver/nvidia/version && "${WALLPAPER_DISABLE_NVIDIA_OFFLOAD:-0}" != "1" ]]; then
+        export __NV_PRIME_RENDER_OFFLOAD="${__NV_PRIME_RENDER_OFFLOAD:-1}"
+        export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
+    fi
+
+    setsid "$VIDEO_RUNNER" --corrupt >> "${HOME}/.local/state/wallpaper-mode.log" 2>&1 8>&- < /dev/null &
+    runner_pid="$!"
+    if ! wait_for_live_startup "$runner_pid" corrupt; then
+        stop_live_wallpaper
+        notify-send "Locked-In Corruption" "Corruption wallpaper failed to start. Switching to Static / Gaming mode." >/dev/null 2>&1 || true
+        return 1
+    fi
+}
+
+apply_cached_static_fast() {
+    local candidate
+    for candidate in \
+        "${HOME}/Pictures/space-wallpaper/current.jpg" \
+        "${HOME}/Pictures/wallpaper-mode/current-static.jpg" \
+        "${HOME}/Pictures/wallpaper-mode/current-static.png"; do
+        if [[ -e "$candidate" ]] && command -v feh >/dev/null; then
+            feh --bg-fill "$candidate" >/dev/null 2>&1 && return 0
+        fi
+    done
+    return 1
+}
+
+activate_static() {
+    local notify="${1:-1}"
+    export DISPLAY="${DISPLAY:-:0}"
+    export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+
+    set_mode static
+    stop_live_wallpaper
+    stop_picom
+
+    if [[ "${WALLPAPER_MODE_FORCE_REFRESH:-0}" == "1" ]]; then
+        apply_cached_static_fast || true
+        setsid -f env WALLPAPER_MODE_FORCE_STATIC=1 WALLPAPER_MODE_FORCE_REFRESH=1 "$APOD_SCRIPT" >/dev/null 2>&1 8>&- < /dev/null || true
+    elif ! apply_cached_static_fast; then
+        WALLPAPER_MODE_FORCE_STATIC=1 "$APOD_SCRIPT" 8>&- || true
+    else
+        setsid -f env WALLPAPER_MODE_FORCE_STATIC=1 "$APOD_SCRIPT" >/dev/null 2>&1 8>&- < /dev/null || true
+    fi
+
+    if [[ "$notify" == "1" ]]; then
+        notify-send "Static + Gaming Mode" "Live wallpaper & picom stopped; static space wallpaper active." >/dev/null 2>&1 || true
+    fi
+}
+
+activate_video() {
+    local notify="${1:-1}"
+    set_mode video
+    if ! start_video; then
+        activate_static 0
+        return 1
+    fi
+    if [[ "$notify" == "1" ]]; then
+        notify-send "Video Wallpaper" "Picom compositor & video wallpaper active." >/dev/null 2>&1 || true
+    fi
+}
+
+activate_corrupt() {
+    local notify="${1:-1}"
+    set_mode corrupt
+    if ! start_corrupt; then
+        activate_static 0
+        return 1
+    fi
+    if [[ "$notify" == "1" ]]; then
+        if [[ "$(raytrace_status)" == "on" ]]; then
+            notify-send "Locked-In // Glitch-BBS [RT:3D]" "Dark-crimson rift, Bad Sectors, Ghost Life & Light GPU Raytracing active." >/dev/null 2>&1 || true
+        else
+            notify-send "Locked-In // Glitch-BBS [2D]" "Dark-crimson rift, Bad Sectors, living ASCII & Ghost Life active." >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+restart_video_if_running() {
+    if [[ "$(mode)" == "video" ]] && { video_wallpaper_running || wallpaper_mpv_running; }; then
+        stop_live_wallpaper
+        start_video
+    fi
+}
+
+apply_mode() {
+    case "$(mode)" in
+        corrupt)
+            activate_corrupt 0
+            ;;
+        video)
+            activate_video 0
+            ;;
+        *)
+            activate_static 0
+            ;;
+    esac
+}
+
+cycle_mode() {
+    local cur
+    cur="$(mode)"
+    case "$cur" in
+        corrupt)
+            activate_static 1
+            ;;
+        static)
+            activate_video 1
+            ;;
+        *)
+            activate_corrupt 1
+            ;;
+    esac
+}
+
+toggle_static_gaming() {
+    if [[ "$(mode)" == "static" ]]; then
+        case "$(last_live_mode)" in
+            video) activate_video 1 ;;
+            *) activate_corrupt 1 ;;
+        esac
+    else
+        activate_static 1
+    fi
+}
+
+status_json() {
+    local current runner_active corrupt_active video_active mpv_count
+    current="$(mode)"
+    mpv_count="$(wallpaper_mpv_count)"
+    runner_active=false
+    corrupt_active=false
+    video_active=false
+
+    if video_wallpaper_running; then
+        runner_active=true
+    fi
+    if corrupt_runner_running; then
+        corrupt_active=true
+    fi
+    if [[ "$runner_active" == true ]] || (( mpv_count > 0 )); then
+        video_active=true
+    fi
+
+    python3 - \
+        "$current" \
+        "$runner_active" \
+        "$corrupt_active" \
+        "$video_active" \
+        "$mpv_count" \
+        "$(audio_status)" \
+        "$(picom_running && printf true || printf false)" \
+        "$(last_live_mode)" \
+        "$(video_source)" \
+        "$DEFAULT_VIDEO_SOURCE" \
+        "$DEFAULT_VIDEO_TITLE" \
+        "$CORRUPT_VIDEO_TITLE" \
+        "$PERMANENT_CORRUPT_VIDEO" \
+        "$CURRENT_META_FILE" \
+        "$HISTORY_FILE" \
+        "$MPV_VOLUME_FILE" \
+        "$MPV_MUTE_FILE" \
+        "$(raytrace_status)" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+(
+    mode,
+    runner_active,
+    corrupt_active,
+    video_active,
+    mpv_count,
+    audio,
+    picom_running,
+    last_live,
+    source,
+    default_source,
+    default_title,
+    corrupt_title,
+    permanent_corrupt_video,
+    meta_path,
+    history_path,
+    mpv_volume_path,
+    mpv_mute_path,
+    raytrace,
+) = sys.argv[1:]
+
+
+def read_json(path, fallback):
+    try:
+        return json.loads(Path(path).read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return fallback
+
+
+def read_mpv_volume(path):
+    try:
+        raw = Path(path).read_text().strip().rstrip("%")
+        volume = int(float(raw))
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        volume = 100
+    return max(0, min(100, volume))
+
+
+def read_bool(path):
+    try:
+        raw = Path(path).read_text().strip().lower()
+    except (FileNotFoundError, OSError):
+        return False
+    return raw in {"1", "on", "true", "yes", "muted"}
+
+
+meta = read_json(meta_path, {})
+history = read_json(history_path, [])
+if not isinstance(meta, dict):
+    meta = {}
+if not isinstance(history, list):
+    history = []
+
+if mode == "corrupt":
+    title = corrupt_title
+    playback_source = permanent_corrupt_video
+    cache_ready = Path(permanent_corrupt_video).exists()
+else:
+    title = ""
+    if meta.get("source") == source:
+        title = str(meta.get("title") or "")
+    if not title and source == default_source:
+        title = default_title
+    if not title:
+        title = os.path.basename(source) if not source.startswith(("http://", "https://", "ytdl:")) else source
+    cache_ready = bool(meta.get("cache_ready")) if meta.get("source") == source else False
+    playback_source = str(meta.get("playback_source") or "")
+
+clean_history = []
+seen = set()
+for entry in history:
+    if not isinstance(entry, dict):
+        continue
+    entry_source = str(entry.get("source") or "")
+    entry_title = str(entry.get("title") or entry_source)
+    if not entry_source or entry_source in seen:
+        continue
+    seen.add(entry_source)
+    clean_history.append({
+        "source": entry_source,
+        "title": entry_title,
+        "id": str(entry.get("id") or ""),
+    })
+    if len(clean_history) >= 10:
+        break
+if source and source not in seen:
+    clean_history.insert(0, {
+        "source": source,
+        "title": default_title if source == default_source else os.path.basename(source),
+        "id": str(meta.get("id") or ""),
+    })
+    clean_history = clean_history[:10]
+
+audio_is_enabled = audio == "on" and mode != "corrupt"
+mpv_volume = read_mpv_volume(mpv_volume_path)
+mpv_muted = read_bool(mpv_mute_path)
+try:
+    mpv_process_count = int(mpv_count)
+except ValueError:
+    mpv_process_count = 0
+
+is_static_gaming = mode == "static"
+
+print(json.dumps({
+    "mode": mode,
+    "last_live_mode": last_live,
+    "video_runner_running": runner_active == "true",
+    "corrupt_running": corrupt_active == "true",
+    "raytrace_enabled": raytrace == "on",
+    "video_running": video_active == "true",
+    "mpv_processes": mpv_process_count,
+    "audio_enabled": audio_is_enabled,
+    "mpv_volume": mpv_volume,
+    "mpv_muted": mpv_muted,
+    "mpv_effective_muted": bool(mpv_muted or not audio_is_enabled),
+    "static_gaming_mode": is_static_gaming,
+    "game_mode_enabled": is_static_gaming,
+    "picom_running": picom_running == "true",
+    "video_suspended_by_game_mode": False,
+    "source": source,
+    "permanent_corrupt_video": permanent_corrupt_video,
+    "title": title,
+    "history": clean_history,
+    "cache_ready": cache_ready,
+    "playback_source": playback_source,
+}))
+PY
+}
+
+case "${1:-toggle}" in
+    static|game|gaming|game-mode|game-mode-on)
+        with_lock activate_static 1
+        ;;
+    game-mode-off)
+        case "$(last_live_mode)" in
+            video) with_lock activate_video 1 ;;
+            *) with_lock activate_corrupt 1 ;;
+        esac
+        ;;
+    game-mode-toggle)
+        with_lock toggle_static_gaming
+        ;;
+    game-mode-status)
+        game_mode_status
+        ;;
+    corrupt|lockin|locked-in|corruption|cyber|bbs)
+        with_lock activate_corrupt 1
+        ;;
+    corrupt-rt|lockin-rt)
+        set_raytrace on
+        with_lock activate_corrupt 1
+        ;;
+    raytrace-on|rt-on)
+        set_raytrace on
+        ;;
+    raytrace-off|rt-off)
+        set_raytrace off
+        ;;
+    raytrace-toggle|rt-toggle)
+        toggle_raytrace
+        ;;
+    raytrace-status|rt-status)
+        raytrace_status
+        ;;
+    video)
+        with_lock activate_video 1
+        ;;
+    toggle|cycle)
+        with_lock cycle_mode
+        ;;
+    apply|startup)
+        with_lock apply_mode
+        ;;
+    refresh-static)
+        WALLPAPER_MODE_FORCE_REFRESH=1 with_lock activate_static 1
+        ;;
+    set-source)
+        if [[ -z "${2:-}" ]]; then
+            printf 'wallpaper-mode set-source requires a video or stream URL/path\n' >&2
+            exit 2
+        fi
+        set_video_source "$2"
+        ;;
+    set-source-start)
+        if [[ -z "${2:-}" ]]; then
+            printf 'wallpaper-mode set-source-start requires a video or stream URL/path\n' >&2
+            exit 2
+        fi
+        set_video_source "$2"
+        with_lock activate_video 1
+        ;;
+    default-video)
+        set_video_source "$DEFAULT_VIDEO_SOURCE"
+        with_lock activate_video 1
+        ;;
+    mpv-volume-status)
+        mpv_volume_control status
+        ;;
+    mpv-volume-up)
+        mpv_volume_control add 3
+        ;;
+    mpv-volume-down)
+        mpv_volume_control add -3
+        ;;
+    mpv-volume-set)
+        if [[ -z "${2:-}" ]]; then
+            printf 'wallpaper-mode mpv-volume-set requires a volume percent\n' >&2
+            exit 2
+        fi
+        mpv_volume_control set "$2"
+        ;;
+    mpv-mute-toggle)
+        mpv_volume_control mute-toggle
+        ;;
+    audio-on)
+        set_audio on
+        with_lock restart_video_if_running
+        ;;
+    audio-off)
+        set_audio off
+        with_lock restart_video_if_running
+        ;;
+    audio-toggle)
+        if [[ "$(audio_status)" == "on" ]]; then
+            set_audio off
+        else
+            set_audio on
+        fi
+        with_lock restart_video_if_running
+        ;;
+    audio-status)
+        audio_status
+        ;;
+    stop-video)
+        with_lock stop_live_wallpaper
+        ;;
+    status-json)
+        status_json
+        ;;
+    status)
+        mode
+        ;;
+    source)
+        video_source
+        ;;
+    *)
+        printf 'usage: wallpaper-mode [corrupt|corrupt-rt|lockin|lockin-rt|raytrace-on|raytrace-off|raytrace-toggle|raytrace-status|video|static|game|toggle|apply|refresh-static|set-source URL|set-source-start URL|default-video|mpv-volume-status|mpv-volume-up|mpv-volume-down|mpv-volume-set N|mpv-mute-toggle|audio-on|audio-off|audio-toggle|audio-status|game-mode-on|game-mode-off|game-mode-toggle|game-mode-status|stop-video|status-json|status|source]\n' >&2
+        exit 2
+        ;;
+esac

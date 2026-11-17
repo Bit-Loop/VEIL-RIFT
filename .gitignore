@@ -1,0 +1,17 @@
+# Build outputs
+build/
+*.so
+*.spv
+*.o
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Cached media / runtime state
+*.mp4
+*.mkv
+*.bgra
+*.sock
+*.ready
+*.lock
