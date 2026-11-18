@@ -497,11 +497,6 @@ start_corrupt() {
         stop_live_wallpaper
     fi
 
-    if [[ -r /proc/driver/nvidia/version && "${WALLPAPER_DISABLE_NVIDIA_OFFLOAD:-0}" != "1" ]]; then
-        export __NV_PRIME_RENDER_OFFLOAD="${__NV_PRIME_RENDER_OFFLOAD:-1}"
-        export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
-    fi
-
     setsid "$VIDEO_RUNNER" --corrupt >> "${HOME}/.local/state/wallpaper-mode.log" 2>&1 8>&- < /dev/null &
     runner_pid="$!"
     if ! wait_for_live_startup "$runner_pid" corrupt; then

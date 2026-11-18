@@ -9,6 +9,9 @@
 
 #define MAX_TRIANGLES 2048
 #define MAX_VERTICES  (MAX_TRIANGLES * 3)
+#define VK_FENCE_TIMEOUT_NS 80000000ULL /* 80ms strict non-blocking cap; never UINT64_MAX */
+#define RIFT_STAGE_OFFSET   0ULL
+#define LIFE_STAGE_OFFSET   (480ULL * 270ULL * 4ULL)
 
 typedef struct {
     float meta[4];      /* x=time, y=aspect, z=emitter_count, w=temporal_blend */
@@ -78,6 +81,9 @@ struct VkRT5070 {
     VkPipelineLayout pipe_layout;
     VkPipeline pipe;
     int frame_count;
+    int faulted;
+    int rift_dirty;
+    int life_dirty;
 };
 
 static uint32_t find_mem_type(
@@ -717,8 +723,12 @@ VkRT5070 *vk_rt5070_init(int gi_w, int gi_h, const char *comp_spv_path) {
         .pCommandBuffers = &rt->cmd
     };
     vkResetFences(rt->dev, 1, &rt->fence);
-    vkQueueSubmit(rt->queue, 1, &si, rt->fence);
-    vkWaitForFences(rt->dev, 1, &rt->fence, VK_TRUE, UINT64_MAX);
+    if (vkQueueSubmit(rt->queue, 1, &si, rt->fence) != VK_SUCCESS ||
+        vkWaitForFences(rt->dev, 1, &rt->fence, VK_TRUE, VK_FENCE_TIMEOUT_NS) != VK_SUCCESS) {
+        rt->faulted = 1;
+        vk_rt5070_destroy(rt);
+        return NULL;
+    }
 
     /* Descriptor Set + Compute Pipeline */
     VkDescriptorSetLayoutBinding binds[5] = {
@@ -827,62 +837,23 @@ void vk_rt5070_upload_fields(
     int rift_w, int rift_h, const void *rift_rgba,
     int life_w, int life_h, const void *life_rgba
 ) {
-    if (!rt) return;
-    size_t rift_sz = (size_t)rift_w * rift_h * 4;
-    size_t life_sz = (size_t)life_w * life_h * 4;
-    if (rift_sz + life_sz > rt->upload_stage.size) return;
-
+    if (!rt || rt->faulted || !rt->upload_stage.mapped) return;
     uint8_t *dst = (uint8_t *)rt->upload_stage.mapped;
-    if (rift_rgba) memcpy(dst, rift_rgba, rift_sz);
-    if (life_rgba) memcpy(dst + rift_sz, life_rgba, life_sz);
-
-    vkResetCommandBuffer(rt->cmd, 0);
-    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    vkBeginCommandBuffer(rt->cmd, &cbbi);
 
     if (rift_rgba && rift_w == rt->rift_img.w && rift_h == rt->rift_img.h) {
-        cmd_img_barrier(
-            rt->cmd, &rt->rift_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT
-        );
-        VkBufferImageCopy bic = {
-            .bufferOffset = 0,
-            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .imageExtent = { (uint32_t)rift_w, (uint32_t)rift_h, 1 }
-        };
-        vkCmdCopyBufferToImage(rt->cmd, rt->upload_stage.buf, rt->rift_img.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
-        cmd_img_barrier(
-            rt->cmd, &rt->rift_img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
-        );
+        size_t rift_sz = (size_t)rift_w * rift_h * 4;
+        if (RIFT_STAGE_OFFSET + rift_sz <= rt->upload_stage.size) {
+            memcpy(dst + RIFT_STAGE_OFFSET, rift_rgba, rift_sz);
+            rt->rift_dirty = 1;
+        }
     }
-
     if (life_rgba && life_w == rt->life_img.w && life_h == rt->life_img.h) {
-        cmd_img_barrier(
-            rt->cmd, &rt->life_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT
-        );
-        VkBufferImageCopy bic = {
-            .bufferOffset = rift_sz,
-            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .imageExtent = { (uint32_t)life_w, (uint32_t)life_h, 1 }
-        };
-        vkCmdCopyBufferToImage(rt->cmd, rt->upload_stage.buf, rt->life_img.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
-        cmd_img_barrier(
-            rt->cmd, &rt->life_img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
-        );
+        size_t life_sz = (size_t)life_w * life_h * 4;
+        if (LIFE_STAGE_OFFSET + life_sz <= rt->upload_stage.size) {
+            memcpy(dst + LIFE_STAGE_OFFSET, life_rgba, life_sz);
+            rt->life_dirty = 1;
+        }
     }
-
-    vkEndCommandBuffer(rt->cmd);
-    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &rt->cmd };
-    vkResetFences(rt->dev, 1, &rt->fence);
-    vkQueueSubmit(rt->queue, 1, &si, rt->fence);
-    vkWaitForFences(rt->dev, 1, &rt->fence, VK_TRUE, UINT64_MAX);
 }
 
 int vk_rt5070_trace(
@@ -898,7 +869,7 @@ int vk_rt5070_trace(
     const VkRTBoxWall *dynamic_boxes,
     void *out_rgba16f
 ) {
-    if (!rt || !out_rgba16f) return -1;
+    if (!rt || rt->faulted || !out_rgba16f) return -1;
 
     /* 1. Rebuild dynamic 3D triangle mesh (architectural bezels + live windows + Bad Sectors) */
     int tri_count = build_scene_triangles((float *)rt->vbo.mapped, aspect, dynamic_box_count, dynamic_boxes);
@@ -923,6 +894,47 @@ int vk_rt5070_trace(
     vkResetCommandBuffer(rt->cmd, 0);
     VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(rt->cmd, &cbbi);
+
+    /* Batch staged rift & life field uploads into the same single command buffer */
+    if (rt->rift_dirty) {
+        cmd_img_barrier(
+            rt->cmd, &rt->rift_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT
+        );
+        VkBufferImageCopy bic_r = {
+            .bufferOffset = RIFT_STAGE_OFFSET,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageExtent = { (uint32_t)rt->rift_img.w, (uint32_t)rt->rift_img.h, 1 }
+        };
+        vkCmdCopyBufferToImage(rt->cmd, rt->upload_stage.buf, rt->rift_img.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic_r);
+        cmd_img_barrier(
+            rt->cmd, &rt->rift_img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+        );
+        rt->rift_dirty = 0;
+    }
+
+    if (rt->life_dirty) {
+        cmd_img_barrier(
+            rt->cmd, &rt->life_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT
+        );
+        VkBufferImageCopy bic_l = {
+            .bufferOffset = LIFE_STAGE_OFFSET,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageExtent = { (uint32_t)rt->life_img.w, (uint32_t)rt->life_img.h, 1 }
+        };
+        vkCmdCopyBufferToImage(rt->cmd, rt->upload_stage.buf, rt->life_img.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic_l);
+        cmd_img_barrier(
+            rt->cmd, &rt->life_img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+        );
+        rt->life_dirty = 0;
+    }
 
     /* Build BLAS on RTX 5070 RT Cores */
     VkAccelerationStructureGeometryTrianglesDataKHR tri_data = {
@@ -1036,8 +1048,12 @@ int vk_rt5070_trace(
     vkEndCommandBuffer(rt->cmd);
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &rt->cmd };
     vkResetFences(rt->dev, 1, &rt->fence);
-    vkQueueSubmit(rt->queue, 1, &si, rt->fence);
-    vkWaitForFences(rt->dev, 1, &rt->fence, VK_TRUE, UINT64_MAX);
+    if (vkQueueSubmit(rt->queue, 1, &si, rt->fence) != VK_SUCCESS ||
+        vkWaitForFences(rt->dev, 1, &rt->fence, VK_TRUE, VK_FENCE_TIMEOUT_NS) != VK_SUCCESS) {
+        fprintf(stderr, "vk_rt5070: GPU fence timeout or device lost; falling back safely\n");
+        rt->faulted = 1;
+        return -1;
+    }
 
     VkMappedMemoryRange inv = {
         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
@@ -1054,7 +1070,9 @@ int vk_rt5070_trace(
 void vk_rt5070_destroy(VkRT5070 *rt) {
     if (!rt) return;
     if (rt->dev) {
-        vkDeviceWaitIdle(rt->dev);
+        if (!rt->faulted) {
+            vkDeviceWaitIdle(rt->dev);
+        }
         if (rt->pipe) vkDestroyPipeline(rt->dev, rt->pipe, NULL);
         if (rt->pipe_layout) vkDestroyPipelineLayout(rt->dev, rt->pipe_layout, NULL);
         if (rt->dp) vkDestroyDescriptorPool(rt->dev, rt->dp, NULL);

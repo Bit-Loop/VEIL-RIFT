@@ -24,14 +24,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-# Automatically enable NVIDIA PRIME render offload when an NVIDIA discrete GPU is present
-if os.environ.get("WALLPAPER_DISABLE_NVIDIA_OFFLOAD") != "1" and Path("/proc/driver/nvidia/version").is_file():
-    os.environ.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
-    os.environ.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
-
-import cairo  # noqa: E402
-import gi  # noqa: E402
-import numpy as np  # noqa: E402
+import cairo
+import gi
+import numpy as np
 
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk  # noqa: E402
@@ -72,16 +67,48 @@ def read_raytrace_config() -> bool:
     return raw in TRUTHY_STRINGS
 
 
-class _NvmlUtilization(ctypes.Structure):
-    _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+def nvidia_headless_rtd3_hazard() -> bool:
+    """Detects hybrid AMD-display + headless NVIDIA dGPU with DynamicPowerManagement != 0.
 
+    On AMD AM5 + Blackwell `nvidia-open`, waking and freeing a headless RTX dGPU across the
+    200 MiB RTD3 threshold while NVML/Xorg poll GSP can trigger `Xid 79 (GPU fallen off bus)`.
+    Returns True when 0 displays are plugged into the NVIDIA GPU AND DynamicPowerManagement != 0
+    (unless overridden via `WALLPAPER_FORCE_VK_RT5070=1`).
+    """
+    if os.environ.get("WALLPAPER_FORCE_VK_RT5070") == "1":
+        return False
 
-class _NvmlMemory(ctypes.Structure):
-    _fields_ = [
-        ("total", ctypes.c_ulonglong),
-        ("free", ctypes.c_ulonglong),
-        ("used", ctypes.c_ulonglong),
-    ]
+    drm_root = Path("/sys/class/drm")
+    nv_cards: list[Path] = []
+    for card in sorted(drm_root.glob("card[0-9]*")):
+        if "-" in card.name:
+            continue
+        try:
+            vendor = (card / "device/vendor").read_text(encoding="ascii").strip().lower()
+        except OSError:
+            continue
+        if vendor == "0x10de":
+            nv_cards.append(card)
+
+    if not nv_cards:
+        return False
+
+    for card in nv_cards:
+        for status_file in drm_root.glob(f"{card.name}-*/status"):
+            try:
+                if status_file.read_text(encoding="ascii").strip() == "connected":
+                    return False
+            except OSError:
+                continue
+
+    try:
+        for line in Path("/proc/driver/nvidia/params").read_text(encoding="ascii", errors="ignore").splitlines():
+            if line.startswith("DynamicPowerManagement:"):
+                val = int(line.split(":", 1)[1].strip())
+                return val != 0
+    except (OSError, ValueError):
+        pass
+    return False
 
 
 class _XWindowAttributes(ctypes.Structure):
@@ -392,38 +419,23 @@ class TelemetrySnapshot:
 
 
 class SystemTelemetry:
-    """Zero-subprocess hardware load reader (/proc + AMD DRM sysfs + NVIDIA NVML ctypes)."""
+    """Zero-subprocess, zero-NVML-RPC hardware load reader (/proc + DRM/hwmon sysfs).
+
+    Avoids opening `libnvidia-ml.so.1` so user wallpaper processes never contend with
+    system daemons (`coolercontrold`) on NVIDIA GSP RM control RPCs or RTD3 power transitions.
+    """
 
     def __init__(self) -> None:
         self._prev_cpu: dict[str, tuple[int, int]] = {}
-        self._nvml: ctypes.CDLL | None = None
-        self._nvml_dev = ctypes.c_void_p()
         self._ema_cpu = 0.10
         self._ema_gpu = 0.06
         self._ema_ram = 0.30
         self._ema_vram = 0.10
         self._burst = 0.08
-        self._init_nvml()
         self._read_cpu_raw()
 
-    def _init_nvml(self) -> None:
-        try:
-            nvml = ctypes.CDLL("libnvidia-ml.so.1")
-            if nvml.nvmlInit_v2() == 0:
-                dev = ctypes.c_void_p()
-                if nvml.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(dev)) == 0:
-                    self._nvml = nvml
-                    self._nvml_dev = dev
-        except OSError:
-            self._nvml = None
-
     def close(self) -> None:
-        if self._nvml is not None:
-            try:
-                self._nvml.nvmlShutdown()
-            except Exception:
-                pass
-            self._nvml = None
+        return None
 
     def _read_cpu_raw(self) -> tuple[float, float]:
         try:
@@ -483,32 +495,41 @@ class SystemTelemetry:
         return max(0.0, min(1.0, (total_kb - avail_kb) / total_kb))
 
     def _read_gpu_raw(self) -> tuple[float, float, int]:
-        nv_gpu = 0.0
-        nv_vram = 0.0
+        drm_gpu = 0.0
+        drm_vram = 0.0
         gpu_temp = 0
-        if self._nvml is not None:
+
+        for card_dev in Path("/sys/class/drm").glob("card[0-9]*/device"):
             try:
-                util = _NvmlUtilization()
-                mem = _NvmlMemory()
-                temp = ctypes.c_uint()
-                self._nvml.nvmlDeviceGetUtilizationRates(self._nvml_dev, ctypes.byref(util))
-                self._nvml.nvmlDeviceGetMemoryInfo(self._nvml_dev, ctypes.byref(mem))
-                self._nvml.nvmlDeviceGetTemperature(self._nvml_dev, 0, ctypes.byref(temp))
-                nv_gpu = max(float(util.gpu), float(util.memory) * 0.6) / 100.0
-                nv_vram = (float(mem.used) / float(mem.total)) if mem.total > 0 else 0.0
-                gpu_temp = int(temp.value)
-            except Exception:
+                busy_path = card_dev / "gpu_busy_percent"
+                if busy_path.is_file():
+                    busy = max(0.0, float(busy_path.read_text().strip()) - 6.0) / 94.0
+                    drm_gpu = max(drm_gpu, min(1.0, busy))
+            except (OSError, ValueError):
+                pass
+            try:
+                used_p = card_dev / "mem_info_vram_used"
+                tot_p = card_dev / "mem_info_vram_total"
+                if used_p.is_file() and tot_p.is_file():
+                    tot = float(tot_p.read_text().strip())
+                    if tot > 0:
+                        drm_vram = max(drm_vram, min(1.0, float(used_p.read_text().strip()) / tot))
+            except (OSError, ValueError):
                 pass
 
-        drm_gpu = 0.0
-        for candidate in Path("/sys/class/drm").glob("card*/device/gpu_busy_percent"):
+        for hwmon in Path("/sys/class/hwmon").glob("hwmon*"):
             try:
-                busy = max(0.0, float(candidate.read_text().strip()) - 8.0) / 92.0
-                drm_gpu = max(drm_gpu, min(1.0, busy))
+                hname = (hwmon / "name").read_text().strip()
+                if hname in {"amdgpu", "nvidia", "k10temp"}:
+                    mc = int((hwmon / "temp1_input").read_text().strip())
+                    if 15000 <= mc <= 115000:
+                        c_val = mc // 1000
+                        if hname in {"amdgpu", "nvidia"} or gpu_temp == 0:
+                            gpu_temp = c_val
             except (OSError, ValueError):
                 continue
 
-        return max(0.0, min(1.0, max(nv_gpu, drm_gpu))), max(0.0, min(1.0, nv_vram)), gpu_temp
+        return max(0.0, min(1.0, drm_gpu)), max(0.0, min(1.0, drm_vram)), gpu_temp
 
     def sample(self) -> TelemetrySnapshot:
         raw_cpu, peak_core = self._read_cpu_raw()
@@ -1192,6 +1213,10 @@ def ensure_gl_library() -> ctypes.CDLL:
     ]
     lib.corrupt_gl_init.restype = ctypes.c_void_p
 
+    if hasattr(lib, "corrupt_gl_enable_vk_rt"):
+        lib.corrupt_gl_enable_vk_rt.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.corrupt_gl_enable_vk_rt.restype = ctypes.c_int
+
     if hasattr(lib, "corrupt_gl_rt_device"):
         lib.corrupt_gl_rt_device.argtypes = [ctypes.c_void_p]
         lib.corrupt_gl_rt_device.restype = ctypes.c_char_p
@@ -1268,7 +1293,7 @@ def ensure_gl_library() -> ctypes.CDLL:
             ctypes.c_int,
             ctypes.POINTER(ctypes.c_float),
         ]
-        lib.corrupt_gl_trace_lights.restype = None
+        lib.corrupt_gl_trace_lights.restype = ctypes.c_int
 
     lib.corrupt_gl_destroy.argtypes = [ctypes.c_void_p]
     lib.corrupt_gl_destroy.restype = None
@@ -1276,7 +1301,7 @@ def ensure_gl_library() -> ctypes.CDLL:
 
 
 class CorruptLockInController:
-    """Drives the 30 FPS OpenGL 3.3 + libmpv + RTX 5070 Vulkan 1.3 Hardware Light Raytracer."""
+    """Drives the 30 FPS OpenGL 3.3 + libmpv + Hybrid-Safe Hardware Light Raytracer."""
 
     TICK_MS = 33
 
@@ -1310,10 +1335,8 @@ class CorruptLockInController:
             raise RuntimeError("Failed to initialize OpenGL + libmpv corrupt renderer")
 
         self.rt_device_name: str = ""
-        if hasattr(self._lib, "corrupt_gl_rt_device"):
-            raw_dev = self._lib.corrupt_gl_rt_device(self._gl_handle)
-            if raw_dev:
-                self.rt_device_name = raw_dev.decode("utf-8", errors="ignore").strip()
+        self._vk_rt_active: bool = False
+        self._vk_rt_blocked_rtd3: bool = nvidia_headless_rtd3_hazard()
 
         self.telemetry = SystemTelemetry()
         self.win_scanner = X11WindowScanner(ignore_xids={self.parent_xid})
@@ -1358,10 +1381,12 @@ class CorruptLockInController:
 
         initial_rects = self.win_scanner.query_rects(self.win_x, self.win_y, self.width, self.height)
         self._push_windows(initial_rects)
+        if self.raytrace_enabled:
+            self._ensure_rt_backend()
         self._push_extra()
         self._upload_veil()
         self._upload_rift()
-        if self.raytrace_enabled:
+        if self.raytrace_enabled and self._vk_rt_active:
             self._trace_rtx_lights(0.0, self.rift.mouse_uv, 0.0, temporal_blend=1.0)
             self._rt_warmed = True
         self._upload_hud(0.0)
@@ -1372,17 +1397,35 @@ class CorruptLockInController:
             except OSError:
                 pass
 
+    def _ensure_rt_backend(self) -> None:
+        """Lazily initializes Vulkan RT-Core backend ONLY when safe from headless RTD3 Xid-79."""
+        if not self._gl_handle or not self.raytrace_enabled:
+            return
+        self._vk_rt_blocked_rtd3 = nvidia_headless_rtd3_hazard()
+        if self._vk_rt_blocked_rtd3:
+            self._vk_rt_active = False
+            return
+        if not self._vk_rt_active and hasattr(self._lib, "corrupt_gl_enable_vk_rt"):
+            ok = self._lib.corrupt_gl_enable_vk_rt(self._gl_handle, 1)
+            self._vk_rt_active = bool(ok == 1)
+            if self._vk_rt_active and hasattr(self._lib, "corrupt_gl_rt_device"):
+                raw_dev = self._lib.corrupt_gl_rt_device(self._gl_handle)
+                if raw_dev:
+                    self.rt_device_name = raw_dev.decode("utf-8", errors="ignore").strip()
+
     def set_raytrace(self, enabled: bool | None) -> None:
-        """Sets or unpins RTX 5070 Hardware Light Raytracing mode and updates GPU uniforms & HUD."""
+        """Sets or unpins Light GPU Raytracing mode and updates GPU uniforms & HUD."""
         self._raytrace_override = enabled
         prev = self.raytrace_enabled
         self.raytrace_enabled = read_raytrace_config() if enabled is None else bool(enabled)
         if self.raytrace_enabled and not prev:
             self._rt_warmed = False
+        if self.raytrace_enabled:
+            self._ensure_rt_backend()
         self._push_extra()
         if self._gl_handle:
             self._upload_rift()
-            if self.raytrace_enabled:
+            if self.raytrace_enabled and self._vk_rt_active:
                 elapsed = time.monotonic() - self.start_mono
                 self._trace_rtx_lights(
                     elapsed,
@@ -1401,10 +1444,11 @@ class CorruptLockInController:
         *,
         temporal_blend: float = 0.24,
     ) -> None:
-        """Dispatches Vulkan 1.3 hardware RT-Core area-light shadow & GI ray queries on RTX 5070."""
+        """Dispatches Vulkan 1.3 hardware RT-Core area-light shadow & GI ray queries when active."""
         if (
             not self._gl_handle
             or not self.raytrace_enabled
+            or not self._vk_rt_active
             or not hasattr(self._lib, "corrupt_gl_trace_lights")
         ):
             return
@@ -1440,7 +1484,7 @@ class CorruptLockInController:
         )
         aspect = float(self.width) / float(max(1, self.height))
         blend = 1.0 if not self._rt_warmed else float(temporal_blend)
-        self._lib.corrupt_gl_trace_lights(
+        rc = self._lib.corrupt_gl_trace_lights(
             self._gl_handle,
             float(elapsed),
             aspect,
@@ -1452,7 +1496,11 @@ class CorruptLockInController:
             n_box,
             box_arr,
         )
-        self._rt_warmed = True
+        if rc != 0:
+            self._vk_rt_active = False
+            self._push_extra()
+        else:
+            self._rt_warmed = True
 
     def set_windows(self, rects: list[tuple[float, float, float, float]] | None) -> None:
         """Pins simulated UV window rects (or passes `None` to resume live X11 EWMH scanning)."""
@@ -1480,9 +1528,15 @@ class CorruptLockInController:
     def _push_extra(self) -> None:
         if not self._gl_handle or not hasattr(self._lib, "corrupt_gl_set_extra"):
             return
+        if not self.raytrace_enabled:
+            rt_mode = 0.0
+        elif self._vk_rt_active:
+            rt_mode = 1.0
+        else:
+            rt_mode = 2.0
         self._lib.corrupt_gl_set_extra(
             self._gl_handle,
-            1.0 if self.raytrace_enabled else 0.0,
+            rt_mode,
             float(self.dwell_sec),
             float(self.no_carrier_y),
             float(self.scar_remap_seed),
@@ -1597,11 +1651,12 @@ class CorruptLockInController:
         ctx.set_font_size(font_sz)
 
         gpu_extra = f" {self.snap.gpu_temp_c}C" if self.snap.gpu_temp_c > 0 else ""
-        gpu_role = (
-            "RTX_5070_RT"
-            if (self.raytrace_enabled and "5070" in self.rt_device_name)
-            else ("VK_LIGHT_RT" if (self.raytrace_enabled and self.rt_device_name) else "RIFT_SPINE")
-        )
+        if self.raytrace_enabled and self._vk_rt_active:
+            gpu_role = "RTX_5070_RT" if "5070" in self.rt_device_name else "VK_LIGHT_RT"
+        elif self.raytrace_enabled:
+            gpu_role = "GL_LIGHT_RT"
+        else:
+            gpu_role = "RIFT_SPINE"
         left_rows = [
             (f"[ tDd // GLITCH_BBS :: 0xDEAD:0xBEEF ]  LOCK {lock_clock}", (0.93, 0.89, 0.83)),
             (f"CPU [{self._ascii_bar(self.snap.cpu)}] {cpu_pct:3d}% :: SYNC_TEAR", cpu_col),
@@ -1632,8 +1687,10 @@ class CorruptLockInController:
 
         scar_pct = self.rift.active_scar_pct()
         blink = "█" if (int(elapsed * 2) % 2 == 0) else "_"
-        if self.raytrace_enabled:
+        if self.raytrace_enabled and self._vk_rt_active:
             rt_tag = "[RTX5070:RT]" if "5070" in self.rt_device_name else "[VK:RT]"
+        elif self.raytrace_enabled:
+            rt_tag = "[GL:RT]"
         else:
             rt_tag = "[2D]"
 
@@ -1701,6 +1758,8 @@ class CorruptLockInController:
                 rt_now = read_raytrace_config()
                 if rt_now != self.raytrace_enabled:
                     self.raytrace_enabled = rt_now
+                    if self.raytrace_enabled:
+                        self._ensure_rt_backend()
                     hud_dirty = True
         else:
             self.snap.burst = round(max(0.0, self.snap.burst * 0.95), 4)
@@ -1794,13 +1853,13 @@ class CorruptLockInController:
                 float(speed_norm),
             )
 
-        # Dispatch RTX 5070 Vulkan 1.3 hardware RT-Core light & shadow tracing when enabled
-        if self.raytrace_enabled:
+        # Dispatch Vulkan 1.3 hardware RT-Core light & shadow tracing at 15 Hz when active & RTD3-safe
+        if self.raytrace_enabled and self._vk_rt_active and (self.tick_count % 2 == 0 or speed_norm > 0.25):
             self._trace_rtx_lights(
                 elapsed,
                 cur_uv,
                 speed_norm,
-                temporal_blend=0.34 if speed_norm > 0.15 else 0.22,
+                temporal_blend=0.36 if speed_norm > 0.15 else 0.24,
             )
 
         if veil_dirty or self.tick_count % 5 == 0:

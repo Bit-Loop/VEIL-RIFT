@@ -15,11 +15,6 @@ from urllib.parse import parse_qs, urlparse
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# Automatically prefer NVIDIA discrete GPU offload when present on hybrid Linux desktops
-if os.environ.get("WALLPAPER_DISABLE_NVIDIA_OFFLOAD") != "1" and Path("/proc/driver/nvidia/version").is_file():
-    os.environ.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
-    os.environ.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
-
 import cairo  # noqa: E402
 import gi  # noqa: E402
 
@@ -47,6 +42,28 @@ def _discover_default_browser_cookies() -> str:
     return ""
 
 
+def _default_mpv_hwdec() -> str:
+    """Avoids `nvdec` waking a headless NVIDIA dGPU across RTD3 when display is on AMD iGPU."""
+    drm_root = Path("/sys/class/drm")
+    amd_connected = False
+    nv_connected = False
+    for status_file in drm_root.glob("card[0-9]*-*/status"):
+        try:
+            if status_file.read_text(encoding="ascii").strip() != "connected":
+                continue
+            card_name = status_file.parent.name.split("-", 1)[0]
+            vendor = (drm_root / card_name / "device/vendor").read_text(encoding="ascii").strip().lower()
+            if vendor == "0x10de":
+                nv_connected = True
+            elif vendor == "0x1002":
+                amd_connected = True
+        except OSError:
+            continue
+    if amd_connected and not nv_connected:
+        return "vaapi"
+    return "auto-safe"
+
+
 DEFAULT_YTDL_COOKIES_FROM_BROWSER = _discover_default_browser_cookies()
 YTDL_COOKIES_FROM_BROWSER = os.environ.get(
     "VIDEO_WALLPAPER_YTDL_COOKIES_FROM_BROWSER",
@@ -56,7 +73,7 @@ MPV_VIDEO_OUTPUT = os.environ.get("VIDEO_WALLPAPER_MPV_VO", "gpu")
 MPV_CORRUPT_VIDEO_OUTPUT = os.environ.get("VIDEO_WALLPAPER_CORRUPT_MPV_VO", "gpu-next")
 MPV_GPU_API = os.environ.get("VIDEO_WALLPAPER_MPV_GPU_API", "opengl")
 MPV_GPU_CONTEXT = os.environ.get("VIDEO_WALLPAPER_MPV_GPU_CONTEXT", "x11")
-MPV_HWDEC = os.environ.get("VIDEO_WALLPAPER_MPV_HWDEC", "nvdec")
+MPV_HWDEC = os.environ.get("VIDEO_WALLPAPER_MPV_HWDEC", _default_mpv_hwdec())
 MPV_YTDL_FORMAT = os.environ.get(
     "VIDEO_WALLPAPER_YTDL_FORMAT",
     "bestvideo[height<=720]+bestaudio/best[height<=720]/best[height<=720]",

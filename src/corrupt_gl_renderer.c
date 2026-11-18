@@ -49,10 +49,13 @@ typedef struct {
     GLuint hud_tex;
     GLuint rt_gi_tex;
 
-    /* Hardware RT-Core Vulkan 1.3 Raytracer on NVIDIA GeForce RTX 5070 */
+    /* Lazy-initialized Hardware RT-Core Vulkan 1.3 Raytracer */
     VkRT5070 *vk_rt;
+    int vk_rt_attempted;
+    char spv_path[1024];
     int rt_w;
     int rt_h;
+    int life_step_counter;
     uint16_t *rt_half_buf;
     uint8_t *life_read_buf;
 
@@ -305,7 +308,8 @@ void *corrupt_gl_init(
         return NULL;
     }
     mpv_set_option_string(mpv, "vo", "libmpv");
-    mpv_set_option_string(mpv, "hwdec", "auto-safe");
+    mpv_set_option_string(mpv, "hwdec", "no");
+    mpv_set_option_string(mpv, "vd-lavc-threads", "2");
     mpv_set_option_string(mpv, "loop-file", "inf");
     mpv_set_option_string(mpv, "aid", "no");
     mpv_set_option_string(mpv, "vid", "1");
@@ -374,28 +378,27 @@ void *corrupt_gl_init(
     c->extra[2] = -1.0f;
     c->extra[3] = 0.0f;
 
-    /* Initialize Vulkan 1.3 Hardware RT-Core Raytracer on RTX 5070 */
-    char spv_path[1024];
+    /* Record SPIR-V path for lazy Vulkan RT-Core init (do NOT open dGPU until requested!) */
     const char *home_dir = getenv("HOME");
     if (!home_dir || !home_dir[0]) home_dir = ".";
     const char *slash = strrchr(frag_shader_path, '/');
     if (slash) {
         size_t dir_len = (size_t)(slash - frag_shader_path);
-        if (dir_len < sizeof(spv_path) - 32) {
-            memcpy(spv_path, frag_shader_path, dir_len);
-            spv_path[dir_len] = '\0';
-            strcat(spv_path, "/corrupt-rt5070.spv");
+        if (dir_len < sizeof(c->spv_path) - 32) {
+            memcpy(c->spv_path, frag_shader_path, dir_len);
+            c->spv_path[dir_len] = '\0';
+            strcat(c->spv_path, "/corrupt-rt5070.spv");
         } else {
-            snprintf(spv_path, sizeof(spv_path), "%s/.local/share/wallpaper-mode/corrupt-rt5070.spv", home_dir);
+            snprintf(c->spv_path, sizeof(c->spv_path), "%s/.local/share/wallpaper-mode/corrupt-rt5070.spv", home_dir);
         }
     } else {
-        snprintf(spv_path, sizeof(spv_path), "%s/.local/share/wallpaper-mode/corrupt-rt5070.spv", home_dir);
+        snprintf(c->spv_path, sizeof(c->spv_path), "%s/.local/share/wallpaper-mode/corrupt-rt5070.spv", home_dir);
     }
-    c->vk_rt = vk_rt5070_init(c->rt_w, c->rt_h, spv_path);
+    c->vk_rt = NULL;
+    c->vk_rt_attempted = 0;
     c->rt_half_buf = (uint16_t *)calloc((size_t)c->rt_w * c->rt_h * 4, sizeof(uint16_t));
     c->life_read_buf = (uint8_t *)calloc((size_t)c->life_w * c->life_h * 4, sizeof(uint8_t));
 
-    /* Ensure our GLX context is active after Vulkan driver init */
     glXMakeCurrent(c->dpy, c->gl_win, c->glctx);
 
     glGenVertexArrays(1, &c->vao);
@@ -474,6 +477,20 @@ void *corrupt_gl_init(
     return c;
 }
 
+int corrupt_gl_enable_vk_rt(void *handle, int enable) {
+    CorruptGL *c = (CorruptGL *)handle;
+    if (!c) return 0;
+    if (!enable) {
+        return c->vk_rt ? 1 : 0;
+    }
+    if (c->vk_rt) return 1;
+    if (c->vk_rt_attempted) return 0;
+    c->vk_rt_attempted = 1;
+    c->vk_rt = vk_rt5070_init(c->rt_w, c->rt_h, c->spv_path);
+    glXMakeCurrent(c->dpy, c->gl_win, c->glctx);
+    return c->vk_rt ? 1 : 0;
+}
+
 const char *corrupt_gl_rt_device(void *handle) {
     CorruptGL *c = (CorruptGL *)handle;
     if (!c || !c->vk_rt) return "";
@@ -498,7 +515,7 @@ void corrupt_gl_upload_rift(void *handle, int w, int h, const void *rgba_data) {
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba_data);
 
-    if (c->vk_rt && c->extra[0] > 0.5f && w == 480 && h == 270) {
+    if (c->vk_rt && c->extra[0] > 0.5f && c->extra[0] < 1.5f && w == 480 && h == 270) {
         vk_rt5070_upload_fields(c->vk_rt, w, h, rgba_data, 0, 0, NULL);
     }
 }
@@ -563,7 +580,7 @@ void corrupt_gl_set_extra(
     }
 }
 
-void corrupt_gl_trace_lights(
+int corrupt_gl_trace_lights(
     void *handle,
     float time_sec,
     float aspect,
@@ -576,7 +593,7 @@ void corrupt_gl_trace_lights(
     const float *boxes_f5
 ) {
     CorruptGL *c = (CorruptGL *)handle;
-    if (!c || !c->vk_rt || !c->rt_half_buf) return;
+    if (!c || !c->vk_rt || !c->rt_half_buf) return -1;
 
     int rc = vk_rt5070_trace(
         c->vk_rt,
@@ -596,7 +613,14 @@ void corrupt_gl_trace_lights(
         glBindTexture(GL_TEXTURE_2D, c->rt_gi_tex);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, c->rt_w, c->rt_h, 0, GL_RGBA, GL_HALF_FLOAT, c->rt_half_buf);
+        return 0;
     }
+
+    /* Faulted or timed out: retire Vulkan handle cleanly and fall back to GLSL RT */
+    vk_rt5070_destroy(c->vk_rt);
+    c->vk_rt = NULL;
+    glXMakeCurrent(c->dpy, c->gl_win, c->glctx);
+    return -1;
 }
 
 void corrupt_gl_step_life(
@@ -639,8 +663,9 @@ void corrupt_gl_step_life(
     glBindVertexArray(c->vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
-    /* Sync life buffer to RTX 5070 Vulkan RT scene when raytracing is active */
-    if (c->vk_rt && c->life_read_buf && c->extra[0] > 0.5f) {
+    /* Stage life buffer every 2nd step only when hardware Vulkan RT is actively tracing */
+    c->life_step_counter++;
+    if (c->vk_rt && c->life_read_buf && c->extra[0] > 0.5f && c->extra[0] < 1.5f && (c->life_step_counter & 1) == 0) {
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glReadPixels(0, 0, c->life_w, c->life_h, GL_RGBA, GL_UNSIGNED_BYTE, c->life_read_buf);
         vk_rt5070_upload_fields(c->vk_rt, 0, 0, NULL, c->life_w, c->life_h, c->life_read_buf);

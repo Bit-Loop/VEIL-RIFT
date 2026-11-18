@@ -816,14 +816,65 @@ void main() {
     //    X11 windows & Bad Sectors + volumetric shafts + 4-ray RT AO + GGX glass!
     // =========================================================================
     if (rt_enabled) {
-        // 8A. 5-tap tent reconstruction of 480x270 RGBA16F RTX 5070 ray-traced light field
+        // 8A. Reconstruct ray-traced light field:
+        //     u_extra.x == 1.0 -> Vulkan 1.3 RT-Core hardware u_rt_gi_tex (480x270 RGBA16F)
+        //     u_extra.x >= 2.0 -> Hybrid-safe native GLSL shadow-ray marcher (zero cross-GPU RTD3 wakeups!)
         vec2 gi_eps = vec2(1.0 / 480.0, 1.0 / 270.0) * 0.85;
-        vec4 gi_c = texture(u_rt_gi_tex, uv);
-        vec4 gi_n = texture(u_rt_gi_tex, clamp(uv + vec2(0.0, -gi_eps.y), vec2(0.001), vec2(0.999)));
-        vec4 gi_s = texture(u_rt_gi_tex, clamp(uv + vec2(0.0,  gi_eps.y), vec2(0.001), vec2(0.999)));
-        vec4 gi_e = texture(u_rt_gi_tex, clamp(uv + vec2( gi_eps.x, 0.0), vec2(0.001), vec2(0.999)));
-        vec4 gi_w = texture(u_rt_gi_tex, clamp(uv + vec2(-gi_eps.x, 0.0), vec2(0.001), vec2(0.999)));
-        vec4 rt_gi = gi_c * 0.44 + (gi_n + gi_s + gi_e + gi_w) * 0.14;
+        vec4 gi_c, gi_n, gi_s, gi_e, gi_w, rt_gi;
+
+        if (u_extra.x < 1.5) {
+            gi_c = texture(u_rt_gi_tex, uv);
+            gi_n = texture(u_rt_gi_tex, clamp(uv + vec2(0.0, -gi_eps.y), vec2(0.001), vec2(0.999)));
+            gi_s = texture(u_rt_gi_tex, clamp(uv + vec2(0.0,  gi_eps.y), vec2(0.001), vec2(0.999)));
+            gi_e = texture(u_rt_gi_tex, clamp(uv + vec2( gi_eps.x, 0.0), vec2(0.001), vec2(0.999)));
+            gi_w = texture(u_rt_gi_tex, clamp(uv + vec2(-gi_eps.x, 0.0), vec2(0.001), vec2(0.999)));
+            rt_gi = gi_c * 0.44 + (gi_n + gi_s + gi_e + gi_w) * 0.14;
+        } else {
+            vec3 sh_irr = vec3(0.0);
+            if (grad_len > 0.0012 && rift_raw.r > 0.004 && rift_raw.g > 0.01 && raw_t < 8.6) {
+                float radius_uv = clamp((2.0 * length(g_eps)) / max(grad_len, 0.020), 0.032, 0.135);
+                vec2 vec_to_L = dir_to_spine * max(0.962 - rift_raw.r, 0.0) * radius_uv * 1.12;
+                vec2 p_L = clamp(uv + vec_to_L, vec2(0.001), vec2(0.999));
+                vec4 r_L = texture(u_rift_tex, p_L);
+                float tq_L = (raw_t < 2.6) ? floor(u_time * 12.0) : floor(u_time * 3.0);
+                float knot_L = pow(ridge(p_L * u_res / 14.0 + tq_L * 0.35 + r_L.b * 19.0), 2.8);
+
+                float trans = 1.0;
+                float weight = 1.0;
+                float acc = 0.0;
+                for (int k = 1; k <= 8; ++k) {
+                    float f = (float(k) - 0.35 + bayer01 * 0.14) / 8.0;
+                    vec2 p_tap = clamp(uv + vec_to_L * f, vec2(0.001), vec2(0.999));
+                    float l_occ = texture(u_life_tex, p_tap).r * 0.65;
+                    float bezel_occ = smoothstep(0.56, 0.86, rawVideoSig(p_tap)) * 0.42;
+                    trans *= (1.0 - l_occ) * (1.0 - bezel_occ);
+                    vec4 r_tap = texture(u_rift_tex, p_tap);
+                    acc += smoothstep(0.60, 0.96, r_tap.r) * (0.50 + 0.50 * r_tap.a) * trans * weight;
+                    weight *= 0.85;
+                }
+                float hue_w = 0.5 + 0.5 * sin(p_L.x * 11.0 - p_L.y * 7.0 + r_L.b * 23.0);
+                vec3 emit_c = mix(vec3(0.84, 0.03, 0.075), vec3(0.40, 0.055, 0.90), smoothstep(0.68, 0.92, hue_w) * 0.55);
+                sh_irr += emit_c * clamp((acc * 0.24 + knot_L * trans * 0.20), 0.0, 0.65);
+            }
+            vec2 to_cur = u_mouse.xy - uv;
+            float d_cur_asp = length(to_cur * vec2(aspect, 1.0));
+            if (d_cur_asp < 0.26) {
+                float c_tr = 1.0;
+                for (int k = 1; k <= 4; ++k) {
+                    vec2 pc = clamp(uv + to_cur * (float(k) / 4.0), vec2(0.001), vec2(0.999));
+                    c_tr *= (1.0 - 0.55 * texture(u_life_tex, pc).r) * (1.0 - 0.38 * smoothstep(0.58, 0.88, rawVideoSig(pc)));
+                }
+                float hot_c = clamp(u_mouse.z * 1.35 + step(1.5, u_extra.y) * 0.65, 0.0, 1.0);
+                vec3 c_rgb = mix(vec3(0.02, 0.84, 0.44), vec3(0.92, 0.24, 0.04), hot_c);
+                sh_irr += c_rgb * exp(-pow(d_cur_asp / 0.10, 2.0)) * c_tr * (0.16 + 0.36 * u_mouse.z);
+            }
+            float sh_ao = clamp(1.0 - 0.45 * win_halo - 0.32 * sec_rim, 0.28, 1.0);
+            rt_gi = vec4(sh_irr, sh_ao);
+            gi_e = vec4(sh_irr + dir_to_spine.x * 0.05, sh_ao);
+            gi_w = vec4(sh_irr - dir_to_spine.x * 0.05, sh_ao);
+            gi_s = vec4(sh_irr + dir_to_spine.y * 0.05, sh_ao);
+            gi_n = vec4(sh_irr - dir_to_spine.y * 0.05, sh_ao);
+        }
 
         vec3 rt_light = noPink(max(rt_gi.rgb, vec3(0.0)));
         float rt_ao   = clamp(rt_gi.a, 0.0, 1.0);

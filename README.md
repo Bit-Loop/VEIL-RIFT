@@ -15,10 +15,9 @@ Interactive **OpenGL 3.3 + `libmpv` + Vulkan 1.3 Hardware RT-Core (`VK_KHR_ray_q
 2. **Ghostly GPU Conway's Game of Life (`corrupt-life-step.frag`)**
    - `640x360` ping-pong FBO cellular automaton seeded along the shattered fracture lips, Bad Sector perimeters, and X11 window frames.
    - Clings ghostly to rift edges, eating/fraying hard boundaries via 4x4 Bayer pixel selection and marching inward over a **10.0-second healing suture timeline**. Dwelling the cursor >1.5s nucleates a true Period-3 Conway Pulsar oscillator; dwelling >6.0s triggers a `[tDd//WATCHDOG]` fang micro-rift.
-3. **Optional Hardware Light Ray Tracing (`vk_rt5070.c` + `corrupt-rt5070.comp`)**
-   - Explicitly selects discrete NVIDIA RTX hardware (`VK_KHR_acceleration_structure` + `VK_KHR_ray_query`, verified at **~1.5 ms/frame** on **NVIDIA GeForce RTX 5070**).
-   - Extrudes slotted 3D architectural panel bezels, live X11 window walls, and active Bad Sector monoliths into a dynamic BLAS/TLAS BVH every frame.
-   - Traces stratified multi-emitter area-light shadow rays, 2-tap volumetric cyber-fog light shafts, and 4-ray contact ambient occlusion + local bounce GI (`480x270` `RGBA16F` with Jimenez IGN temporal accumulation), coupled with normal-mapped circuit relief and shadow-gated GGX/Schlick-Fresnel CRT glass specular glints.
+3. **Dual-Path Light Ray Tracing (`vk_rt5070.c` + `corrupt-rt5070.comp` + `corrupt-veil.frag`)**
+   - **Hardware RT-Core Path (`[RTX5070:RT]`)**: Lazily activates discrete NVIDIA RTX hardware (`VK_KHR_acceleration_structure` + `VK_KHR_ray_query`, verified at **~1.5 ms/frame** on **NVIDIA GeForce RTX 5070** with strict `80 ms` non-blocking fence timeouts and single-submit batched command buffers). Extrudes slotted 3D panel bezels, live X11 window walls, and active Bad Sector monoliths into a dynamic BLAS/TLAS BVH to trace stratified area-light shadow rays, volumetric shafts, and 4-ray contact AO + local bounce GI (`480x270` `RGBA16F` with Jimenez IGN temporal accumulation).
+   - **Hybrid RTD3 Guard & Native GLSL Ray Marcher (`[GL:RT]`)**: On hybrid AMD iGPU + headless NVIDIA dGPU systems where `NVreg_DynamicPowerManagement != 0` (laptop-style PCIe RTD3 D3cold), automatically keeps the headless NVIDIA GPU untouched (`0 MiB` VRAM, zero NVML/GSP RPC contention, preventing `NVRM: Xid 79` bus drops on mode transitions) and runs an 8-tap spine + 4-tap cursor GLSL shadow-ray marcher directly on the active display GPU. Plugging a display into the RTX GPU or setting `NVreg_DynamicPowerManagement=0x00` automatically unlocks `[RTX5070:RT]` (or force with `WALLPAPER_FORCE_VK_RT5070=1`).
 4. **Unified Static + Gaming Mode (`wallpaper-mode static`)**
    - Combines static space wallpaper (`nasa-apod-wallpaper.sh` — NASA APOD + Bing UHD fallback) with Gaming Mode: stops all live GPU/video wallpaper processes and stops `picom` compositor in `< 0.6s` for zero compositor latency and 0% background GPU usage.
 
@@ -51,7 +50,7 @@ cd VEIL-RIFT
 ./install.sh
 ```
 
-On hybrid AMD iGPU + NVIDIA discrete RTX laptops/desktops, `video-wallpaper.py` and `wallpaper-mode` automatically enable `__NV_PRIME_RENDER_OFFLOAD=1` and `__GLX_VENDOR_LIBRARY_NAME=nvidia` when `/proc/driver/nvidia/version` is present (disable with `WALLPAPER_DISABLE_NVIDIA_OFFLOAD=1`).
+> **Hybrid AMD iGPU + NVIDIA RTX Desktop Note**: If your monitor is plugged into the motherboard's AMD iGPU while an NVIDIA RTX 50-series GPU has 0 connected displays and `DynamicPowerManagement: 3` (RTD3 D3cold), `VEIL-RIFT` automatically runs OpenGL/VA-API + `[GL:RT]` on the display GPU so the headless NVIDIA card never crosses the 200 MiB RTD3 power-gate cliff (`NVRM: Xid 79`). To unlock hardware Vulkan `[RTX5070:RT]` without plugging a monitor into the RTX card, disable laptop RTD3 on your desktop via `/etc/modprobe.d/nvidia-pm.conf` (`options nvidia NVreg_DynamicPowerManagement=0x00`, rebuild initramfs, and reboot).
 
 ---
 
